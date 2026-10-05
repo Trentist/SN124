@@ -1,0 +1,106 @@
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+"""The victim mannequin ships complete: raw mesh, licence, pre-split parts, and no writes at load time."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest import mock
+
+import swarm_worlds
+
+_ASSET_DIR = Path(swarm_worlds.maps_dir()) / "custom" / "people" / "open_mannequin_raw"
+_RAW_OBJ = _ASSET_DIR / "mannequin_a_raw.obj"
+_RAW_MTL = _ASSET_DIR / "mannequin_a_raw.mtl"
+_LICENSE = _ASSET_DIR / "LICENSE.txt"
+_SPLIT_DIR = _ASSET_DIR / "split"
+
+
+def _obj_bounds(path):
+    """Min and max corner of the vertex cloud in an OBJ file."""
+    mn = [float("inf")] * 3
+    mx = [float("-inf")] * 3
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if not line.startswith("v "):
+                continue
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+            mn[0] = min(mn[0], x)
+            mn[1] = min(mn[1], y)
+            mn[2] = min(mn[2], z)
+            mx[0] = max(mx[0], x)
+            mx[1] = max(mx[1], y)
+            mx[2] = max(mx[2], z)
+    return tuple(mn), tuple(mx)
+
+
+def _materials_in_mtl(path):
+    """Every material name declared by a newmtl line, in file order."""
+    mats = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.lower().startswith("newmtl "):
+                mats.append(line.split(None, 1)[1].strip())
+    return mats
+
+
+def test_loadable():
+    """The raw mesh is on disk and stands 1.5 to 2.1 m on the OBJ Y axis, with real width and depth."""
+    assert _RAW_OBJ.is_file(), f"missing raw mannequin: {_RAW_OBJ}"
+    mn, mx = _obj_bounds(_RAW_OBJ)
+    # OBJ is Y-up so "standing height" is the Y extent
+    standing_height = mx[1] - mn[1]
+    assert 1.5 <= standing_height <= 2.1, (
+        f"unexpected standing height {standing_height:.3f}"
+    )
+    assert all(b > 0 for b in (mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]))
+
+
+def test_license_present():
+    """The asset carries a licence naming CC0 or the public domain, so it can be redistributed."""
+    assert _LICENSE.is_file()
+    text = _LICENSE.read_text()
+    assert "CC0" in text or "public domain" in text.lower()
+
+
+def test_prebaked_parts_present():
+    """Every material in the MTL already has its own split OBJ and MTL sitting on disk."""
+    assert _RAW_MTL.is_file()
+    materials = _materials_in_mtl(_RAW_MTL)
+    assert materials, "MTL has no newmtl entries"
+    assert _SPLIT_DIR.is_dir()
+    for mat in materials:
+        safe = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in mat)
+        part_obj = _SPLIT_DIR / f"{safe}.obj"
+        part_mtl = _SPLIT_DIR / f"{safe}.mtl"
+        assert part_obj.is_file(), f"missing split OBJ for material {mat}: {part_obj}"
+        assert part_mtl.is_file(), f"missing split MTL for material {mat}: {part_mtl}"
+
+
+def test_no_runtime_writes():
+    """Reading the pre-split parts creates no directories, so evaluation is not rebuilding the split asset tree."""
+    from swarm.core.env_builder import mesh_loader
+
+    with mock.patch("os.makedirs") as mk_mkdir:
+        list(mesh_loader.iter_prebaked_parts(_SPLIT_DIR))
+        for path in mesh_loader.iter_prebaked_parts(_SPLIT_DIR):
+            mesh_loader.obj_bounds(path)
+        assert not mk_mkdir.called, "mesh_loader created directories at runtime"

@@ -1,0 +1,93 @@
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+"""Every environment type must produce a world a search run can actually be scored against."""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pybullet as p
+import pytest
+
+from swarm.constants import SIM_DT
+from swarm.core.env_builder.sar_types import (
+    BodyCategory,
+)
+from swarm.core.env_builder.sar_world import build_sar_world
+from swarm.validator.task_gen import task_for_seed_and_type
+
+_MAPS = {
+    "open":      2,
+    "mountain":  3,
+    "city":      1,
+    "village":   4,
+    "forest":    6,
+    "warehouse": 5,
+}
+
+
+@pytest.mark.parametrize("name,ctype", list(_MAPS.items()))
+def test_per_map_well_formed(sar_pybullet, name, ctype):
+    """Each environment gives a tagged victim standing on a support body, a finite surface height, and a search centre within 30 m of the victim."""
+    p.resetSimulation(physicsClientId=sar_pybullet)
+    world = build_sar_world(
+        sar_pybullet, seed=1234 + ctype, challenge_type=ctype,
+        start=(0.0, 0.0, 1.5), goal=(8.0, 8.0, 1.5),
+    )
+    assert len(world.victim_uids) >= 1
+    for u in world.victim_uids:
+        assert world.body_tags.get(u) == BodyCategory.VICTIM.value
+    assert world.support_uid in world.body_tags
+    assert world.body_tags[world.support_uid].startswith("SUPPORT_")
+    assert math.isfinite(world.surface_z)
+    assert world.safety_patch.support_uid == world.support_uid
+    assert world.safety_patch.surface_z == pytest.approx(world.surface_z)
+    mn, mx = world.victim_aabb
+    assert all(b > a for a, b in zip(mn, mx))
+    assert world.search_centre is not None
+    cx, cy = world.search_centre
+    vx, vy = world.victim_centre_xy
+    assert math.hypot(cx - vx, cy - vy) <= 30.0 + 1e-6
+
+
+def _victim_pixels(cli, eye, target, victim_uids) -> int:
+    """Victim pixels in a small top-down segmentation frame from eye toward target."""
+    view = p.computeViewMatrix(eye, target, [0, 1, 0])
+    proj = p.computeProjectionMatrixFOV(60, 1.0, 0.05, 200)
+    seg = p.getCameraImage(128, 128, view, proj, renderer=p.ER_TINY_RENDERER, physicsClientId=cli)[4]
+    seg = np.reshape(seg, (128, 128)) & ((1 << 24) - 1)
+    return int(np.isin(seg, list(victim_uids)).sum())
+
+
+def test_victim_on_a_bumpy_mountain_slope_is_not_buried(sar_pybullet):
+    """On mountain seed 14832 the lying victim rests on the slope, so the drone sees it from hover height."""
+    task = task_for_seed_and_type(sim_dt=SIM_DT, seed=14832, challenge_type=3, family_id="cf_search_and_rescue")
+    p.resetSimulation(physicsClientId=sar_pybullet)
+    world = build_sar_world(sar_pybullet, seed=14832, challenge_type=3, start=task.start, goal=task.goal)
+    mn, mx = (np.asarray(v) for v in world.victim_aabb)
+    centre = ((mn + mx) / 2).tolist()
+    eye = [centre[0], centre[1], float(mx[2]) + 3.0]
+
+    seen = _victim_pixels(sar_pybullet, eye, centre, world.victim_uids)
+    home = p.getBasePositionAndOrientation(world.support_uid, physicsClientId=sar_pybullet)
+    p.resetBasePositionAndOrientation(world.support_uid, [0, 0, -1000], [0, 0, 0, 1], physicsClientId=sar_pybullet)
+    whole = _victim_pixels(sar_pybullet, eye, centre, world.victim_uids)
+    p.resetBasePositionAndOrientation(world.support_uid, home[0], home[1], physicsClientId=sar_pybullet)
+
+    assert whole > 0
+    assert seen / whole >= 0.9, f"only {100 * seen / whole:.0f}% of the victim shows above the terrain"

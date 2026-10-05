@@ -1,0 +1,175 @@
+# The MIT License (MIT)
+# Copyright © 2026 Swarm
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+"""Cached backend state across a restart, and the queue the heartbeat reports while scoring."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+import time
+
+from swarm.constants import BACKEND_GRACE_PERIOD_SEC
+from swarm.validator import backend_api
+from swarm.validator.utils_parts import heartbeat as heartbeat_module
+
+
+def _run(coro):
+    """Drive a coroutine to completion on a throwaway event loop."""
+    return asyncio.run(coro)
+
+
+class _DummyHotkey:
+    """Wallet hotkey stub with a fixed ss58 address and a constant signature."""
+    ss58_address = "validator_hotkey"
+    def sign(self, message: bytes) -> bytes:
+        """Two constant bytes standing in for a real signature."""
+        return b"\x01\x02"
+
+
+class _DummyWallet:
+    """Wallet stub carrying nothing but the stub hotkey."""
+    hotkey = _DummyHotkey()
+
+
+def _build_client(monkeypatch, tmp_path, wallet=None):
+    """Point the backend client's state paths into tmp_path and return it aimed at a fake host."""
+    monkeypatch.setattr(backend_api, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(backend_api, "RUNTIME_STATE_FILE", tmp_path / "runtime_state.json")
+    return backend_api.BackendApiClient(wallet=wallet, base_url="http://backend.local")
+
+
+def test_cached_weights_returned_within_grace_period(monkeypatch, tmp_path):
+    """A state file written a minute ago is loaded and still serves its weights from disk."""
+    state_file = tmp_path / "runtime_state.json"
+    state_file.write_text(json.dumps({
+        "last_weights": {"42": 1.0},
+        "reeval_queue": [],
+        "last_sync": time.time() - 60,
+        "benchmark_epoch": 1,
+    }))
+    client = _build_client(monkeypatch, tmp_path, wallet=_DummyWallet())
+    try:
+        assert client.last_sync_ts > 0
+        assert client.get_cached_weights() == {"42": 1.0}
+        assert (time.time() - client.last_sync_ts) < BACKEND_GRACE_PERIOD_SEC
+    finally:
+        _run(client.close())
+
+
+def test_cached_weights_empty_after_grace_period(monkeypatch, tmp_path):
+    """A state file older than the grace window loads with its stale timestamp intact."""
+    state_file = tmp_path / "runtime_state.json"
+    state_file.write_text(json.dumps({
+        "last_weights": {"42": 1.0},
+        "reeval_queue": [],
+        "last_sync": time.time() - BACKEND_GRACE_PERIOD_SEC - 100,
+        "benchmark_epoch": 1,
+    }))
+    client = _build_client(monkeypatch, tmp_path, wallet=_DummyWallet())
+    try:
+        assert (time.time() - client.last_sync_ts) > BACKEND_GRACE_PERIOD_SEC
+    finally:
+        _run(client.close())
+
+
+def test_heartbeat_remove_uid_from_queue():
+    """Dropping a miner edits the caller's own list in place and leaves the other entry alone."""
+    from swarm.validator.utils_parts.heartbeat import HeartbeatManager
+
+    class FakeApi:
+        """Backend stub whose heartbeat post does nothing at all."""
+        async def post_heartbeat(self, **kw):
+            """Accept a heartbeat payload and throw it away."""
+            pass
+
+    loop = asyncio.new_event_loop()
+    hb = HeartbeatManager(FakeApi(), loop)
+    queue = [{"uid": 10, "phase": "screening"}, {"uid": 20, "phase": "benchmark"}]
+    hb.set_queue(queue)
+
+    hb.remove_uid_from_queue(10)
+    assert len(hb._queue) == 1
+    assert hb._queue[0]["uid"] == 20
+    assert hb._queue is queue
+
+    loop.close()
+
+
+def test_heartbeat_finish_removes_uid_and_sends_idle():
+    """Closing a session drops the finished miner from the queue and posts idle last."""
+    from swarm.validator.utils_parts.heartbeat import HeartbeatManager
+
+    calls = []
+
+    class FakeApi:
+        """Backend stub that records every heartbeat payload it is sent."""
+        async def post_heartbeat(self, **kw):
+            """Append the payload to the shared record of calls."""
+            calls.append(kw)
+
+    loop = asyncio.new_event_loop()
+    hb = HeartbeatManager(FakeApi(), loop)
+    queue = [{"uid": 10, "phase": "screening"}, {"uid": 20, "phase": "benchmark"}]
+
+    async def run_test():
+        """Drive the finish path on the loop, then check the queue and the closing post."""
+        hb._queue = queue
+        hb._progress = 5
+        hb._total = 200
+        hb._status = "evaluating_screening"
+        hb._uid = 10
+        hb._active = True
+        hb._session_id = 1
+
+        await hb._finish_async(5, 1, 10)
+
+        assert all(q["uid"] != 10 for q in hb._queue)
+        idle_call = calls[-1]
+        assert idle_call["status"] == "idle"
+        assert isinstance(idle_call["queue"], list)
+
+    loop.run_until_complete(run_test())
+    loop.close()
+
+
+def test_heartbeat_timer_ends_quietly_when_its_loop_is_closed(monkeypatch):
+    """The timer thread stops instead of raising once the loop it feeds is gone."""
+    monkeypatch.setattr(heartbeat_module, "_TIMER_INTERVAL_SECONDS", 0.01)
+
+    class FakeApi:
+        """Stands in for the backend client the manager posts to."""
+
+        async def post_heartbeat(self, **kw):
+            """Accept any heartbeat and return nothing."""
+
+    escaped: list = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: escaped.append(args.exc_value))
+
+    loop = asyncio.new_event_loop()
+    hb = heartbeat_module.HeartbeatManager(FakeApi(), loop)
+    hb._active = True
+    hb._session_id = 1
+    loop.close()
+
+    thread = threading.Thread(target=hb._timer_loop, args=(1,), daemon=True)
+    thread.start()
+    thread.join(timeout=5.0)
+
+    assert not thread.is_alive()
+    assert escaped == []
